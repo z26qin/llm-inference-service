@@ -16,10 +16,10 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Generic, TypeVar
+from typing import Awaitable, Callable
 from uuid import uuid4
 
-T = TypeVar("T")
+from app.engine.vllm_engine import GenerationOutput, GenerationRequest
 
 
 class ClientTier(IntEnum):
@@ -58,7 +58,7 @@ class BatchConfig:
 
 
 @dataclass(order=True)
-class PrioritizedRequest(Generic[T]):
+class PrioritizedRequest:
     """A request with priority for queue ordering.
 
     Uses negative priority for max-heap behavior (higher priority first).
@@ -67,16 +67,16 @@ class PrioritizedRequest(Generic[T]):
     priority: int  # Negative of ClientTier for max-heap
     timestamp: float  # For FIFO within same priority
     request_id: str = field(compare=False)
-    data: T = field(compare=False)
-    future: asyncio.Future[Any] = field(compare=False, repr=False)
+    data: GenerationRequest = field(compare=False)
+    future: asyncio.Future[GenerationOutput] = field(compare=False, repr=False)
 
     @classmethod
     def create(
         cls,
-        data: T,
+        data: GenerationRequest,
         tier: ClientTier = ClientTier.STANDARD,
         request_id: str | None = None,
-    ) -> PrioritizedRequest[T]:
+    ) -> PrioritizedRequest:
         """Create a new prioritized request.
 
         Args:
@@ -96,7 +96,7 @@ class PrioritizedRequest(Generic[T]):
         )
 
 
-class RequestQueue(Generic[T]):
+class RequestQueue:
     """Priority queue for managing inference requests.
 
     Provides priority-based ordering with FIFO ordering within
@@ -110,10 +110,10 @@ class RequestQueue(Generic[T]):
             config: Queue configuration. Loads from env if not provided.
         """
         self.config = config or BatchConfig.from_env()
-        self._queue: asyncio.PriorityQueue[PrioritizedRequest[T]] = asyncio.PriorityQueue(
+        self._queue: asyncio.PriorityQueue[PrioritizedRequest] = asyncio.PriorityQueue(
             maxsize=self.config.max_queue_size
         )
-        self._pending_requests: dict[str, PrioritizedRequest[T]] = {}
+        self._pending_requests: dict[str, PrioritizedRequest] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -133,11 +133,11 @@ class RequestQueue(Generic[T]):
 
     async def enqueue(
         self,
-        data: T,
+        data: GenerationRequest,
         tier: ClientTier = ClientTier.STANDARD,
         request_id: str | None = None,
         timeout: float | None = None,
-    ) -> Any:
+    ) -> GenerationOutput:
         """Add a request to the queue and wait for result.
 
         Args:
@@ -173,7 +173,7 @@ class RequestQueue(Generic[T]):
             async with self._lock:
                 self._pending_requests.pop(request.request_id, None)
 
-    async def dequeue(self, timeout: float | None = None) -> PrioritizedRequest[T] | None:
+    async def dequeue(self, timeout: float | None = None) -> PrioritizedRequest | None:
         """Remove and return the highest priority request.
 
         Args:
@@ -193,7 +193,7 @@ class RequestQueue(Generic[T]):
         self,
         max_size: int | None = None,
         max_wait_ms: float | None = None,
-    ) -> list[PrioritizedRequest[T]]:
+    ) -> list[PrioritizedRequest]:
         """Dequeue a batch of requests.
 
         Waits up to max_wait_ms for the first request, then collects
@@ -209,7 +209,7 @@ class RequestQueue(Generic[T]):
         max_size = max_size or self.config.max_batch_size
         max_wait_ms = max_wait_ms or self.config.max_wait_time_ms
 
-        batch: list[PrioritizedRequest[T]] = []
+        batch: list[PrioritizedRequest] = []
 
         # Wait for first request with timeout
         first = await self.dequeue(timeout=max_wait_ms / 1000)
@@ -248,7 +248,7 @@ class RequestQueue(Generic[T]):
             self._pending_requests.pop(request_id, None)
             return True
 
-    def complete(self, request_id: str, result: Any) -> bool:
+    def complete(self, request_id: str, result: GenerationOutput) -> bool:
         """Complete a request with a result.
 
         Args:
@@ -309,7 +309,7 @@ class RequestQueue(Generic[T]):
             return count
 
 
-class BatchProcessor(Generic[T]):
+class BatchProcessor:
     """Processes batches of requests from a queue.
 
     Runs as a background task, collecting batches and dispatching
@@ -318,8 +318,8 @@ class BatchProcessor(Generic[T]):
 
     def __init__(
         self,
-        queue: RequestQueue[T],
-        processor: Any,  # Callable that processes requests
+        queue: RequestQueue,
+        processor: Callable[[GenerationRequest, str], Awaitable[GenerationOutput]],
         config: BatchConfig | None = None,
     ) -> None:
         """Initialize the batch processor.
@@ -373,7 +373,7 @@ class BatchProcessor(Generic[T]):
                 # Log error but continue processing
                 continue
 
-    async def _process_request(self, request: PrioritizedRequest[T]) -> None:
+    async def _process_request(self, request: PrioritizedRequest) -> None:
         """Process a single request.
 
         Args:
