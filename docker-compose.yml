@@ -1,0 +1,149 @@
+# =============================================================================
+# Docker Compose Configuration
+# =============================================================================
+# Provides local development environment with GPU support
+#
+# Usage:
+#   GPU:     docker compose up
+#   CPU:     docker compose --profile cpu up
+#   Dev:     docker compose --profile dev up
+
+services:
+  # ---------------------------------------------------------------------------
+  # LLM Inference Service (GPU)
+  # ---------------------------------------------------------------------------
+  llm-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: llm-inference-service:latest
+    container_name: llm-inference-service
+    ports:
+      - "8000:8000"
+    environment:
+      # Model configuration
+      - MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.90}
+      - MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-}
+      - DTYPE=${DTYPE:-auto}
+      - ENFORCE_EAGER=${ENFORCE_EAGER:-false}
+      - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-true}
+      # Server configuration
+      - HOST=0.0.0.0
+      - PORT=8000
+      - WORKERS=1
+      - DEBUG=${DEBUG:-false}
+      # CORS
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - CORS_ALLOW_CREDENTIALS=true
+      # Batching
+      - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-32}
+      - MAX_WAIT_TIME_MS=${MAX_WAIT_TIME_MS:-100}
+      - REQUEST_TIMEOUT_MS=${REQUEST_TIMEOUT_MS:-30000}
+      # HuggingFace
+      - HF_HOME=/app/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      # Persist model cache
+      - model-cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # LLM Inference Service (CPU - for testing without GPU)
+  # ---------------------------------------------------------------------------
+  llm-service-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: llm-inference-service:cpu
+    container_name: llm-inference-service-cpu
+    profiles:
+      - cpu
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - TENSOR_PARALLEL_SIZE=1
+      - GPU_MEMORY_UTILIZATION=0.0
+      - DTYPE=float16
+      - ENFORCE_EAGER=true
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEBUG=${DEBUG:-false}
+      - HF_HOME=/app/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+      # vLLM CPU settings
+      - VLLM_CPU_ONLY=1
+    volumes:
+      - model-cache:/app/.cache/huggingface
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Development Service
+  # ---------------------------------------------------------------------------
+  llm-service-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    image: llm-inference-service:dev
+    container_name: llm-inference-service-dev
+    profiles:
+      - dev
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      - DEBUG=true
+      - HF_HOME=/app/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      # Mount source for hot reload
+      - ./app:/app/app:ro
+      - model-cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  model-cache:
+    name: llm-inference-model-cache
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  default:
+    name: llm-inference-network
+    driver: bridge
