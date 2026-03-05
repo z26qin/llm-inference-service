@@ -7,7 +7,6 @@ inference endpoints powered by vLLM.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import signal
 import sys
@@ -21,7 +20,10 @@ from fastapi.responses import JSONResponse
 
 from app.api.models import ErrorDetail, ErrorResponse
 from app.api.routes import router
+from app.cache.prompt_cache import get_prompt_cache
+from app.cache.redis_client import get_redis_client, initialize_redis, shutdown_redis
 from app.engine.vllm_engine import get_engine, initialize_engine, shutdown_engine
+from app.middleware.rate_limiter import RateLimitMiddleware
 
 
 # =============================================================================
@@ -64,7 +66,7 @@ settings = Settings()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan events.
 
-    Handles startup (model loading) and shutdown (graceful cleanup).
+    Handles startup (model loading, Redis connection) and shutdown (graceful cleanup).
 
     Args:
         app: The FastAPI application instance.
@@ -74,7 +76,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     # Startup
     print(f"Starting {settings.app_name} v{settings.app_version}")
-    print(f"Loading model... (this may take a while)")
+
+    # Initialize Redis (optional, continues if unavailable)
+    redis_client = await initialize_redis()
+    if redis_client is not None:
+        print("Redis connected")
+    else:
+        print("Redis unavailable (caching and distributed rate limiting disabled)")
+
+    print("Loading model... (this may take a while)")
 
     try:
         await initialize_engine()
@@ -90,6 +100,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shutdown
     print("Shutting down gracefully...")
     await shutdown_engine()
+    await shutdown_redis()
     print("Shutdown complete")
 
 
@@ -115,6 +126,8 @@ OpenAI-compatible API powered by vLLM with:
 - **High Performance**: Continuous batching with PagedAttention
 - **Streaming Support**: Server-Sent Events for real-time generation
 - **Production Ready**: Health checks, graceful shutdown, error handling
+- **Redis Caching**: Response caching for deterministic requests
+- **Rate Limiting**: Per-IP rate limiting with Redis or in-memory backend
 
 ### Endpoints
 
@@ -123,6 +136,7 @@ OpenAI-compatible API powered by vLLM with:
 - `GET /v1/models` - List available models
 - `GET /health` - Health check
 - `GET /ready` - Readiness probe
+- `GET /metrics` - Cache and rate limit metrics
         """,
         docs_url="/docs",
         redoc_url="/redoc",
@@ -138,6 +152,9 @@ OpenAI-compatible API powered by vLLM with:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Rate limiting middleware (lazy initialization after Redis connects)
+    app.add_middleware(RateLimitMiddleware)
 
     # Include API routes
     app.include_router(router)
@@ -175,31 +192,93 @@ def _register_health_endpoints(app: FastAPI) -> None:
         "/ready",
         tags=["Health"],
         summary="Readiness check",
-        description="Readiness probe to verify model is loaded and ready.",
+        description="Readiness probe to verify model and Redis are ready.",
     )
     async def readiness_check() -> JSONResponse:
         """Readiness probe endpoint.
 
-        Verifies that the model is loaded and ready to serve requests.
+        Verifies that the model is loaded and Redis is connected (if enabled).
         Returns 503 if not ready.
         """
+        checks: dict = {"engine": False, "redis": None}
+        reasons: list[str] = []
+
+        # Check engine
         try:
             engine = await get_engine()
             if engine.is_ready():
-                return JSONResponse(
-                    status_code=status.HTTP_200_OK,
-                    content={"status": "ready", "model": engine.model_name},
-                )
+                checks["engine"] = True
             else:
-                return JSONResponse(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    content={"status": "not_ready", "reason": "model_loading"},
-                )
+                reasons.append("model_loading")
         except Exception as e:
+            reasons.append(f"engine_error: {e}")
+
+        # Check Redis (optional)
+        redis_client = await get_redis_client()
+        if redis_client is not None:
+            try:
+                if await redis_client.health_check():
+                    checks["redis"] = True
+                else:
+                    checks["redis"] = False
+                    reasons.append("redis_unhealthy")
+            except Exception:
+                checks["redis"] = False
+                reasons.append("redis_error")
+
+        # Determine overall status
+        is_ready = checks["engine"] and (checks["redis"] is None or checks["redis"])
+
+        if is_ready:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "status": "ready",
+                    "checks": checks,
+                    "model": engine.model_name if checks["engine"] else None,
+                },
+            )
+        else:
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={"status": "not_ready", "reason": str(e)},
+                content={
+                    "status": "not_ready",
+                    "checks": checks,
+                    "reasons": reasons,
+                },
             )
+
+    @app.get(
+        "/metrics",
+        tags=["Health"],
+        summary="Service metrics",
+        description="Cache statistics and rate limiter configuration.",
+    )
+    async def metrics() -> dict:
+        """Metrics endpoint for monitoring.
+
+        Returns cache statistics and rate limiter configuration.
+        """
+        # Cache stats
+        cache = get_prompt_cache()
+        cache_stats = cache.get_stats().to_dict()
+
+        # Redis status
+        redis_client = await get_redis_client()
+        redis_connected = redis_client is not None and redis_client.is_connected()
+
+        return {
+            "cache": {
+                "enabled": cache.config.enabled,
+                "connected": redis_connected,
+                "stats": cache_stats,
+            },
+            "rate_limit": {
+                "enabled": os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true",
+                "requests_per_minute": int(os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "60")),
+                "window_seconds": int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
+            },
+        }
 
     @app.get(
         "/",
@@ -216,6 +295,7 @@ def _register_health_endpoints(app: FastAPI) -> None:
             "openapi": "/openapi.json",
             "health": "/health",
             "ready": "/ready",
+            "metrics": "/metrics",
         }
 
 

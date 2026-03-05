@@ -7,13 +7,11 @@ streaming (SSE) and non-streaming responses.
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from typing import AsyncIterator
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.models import (
@@ -37,7 +35,13 @@ from app.api.models import (
     ModelList,
     UsageInfo,
 )
+from app.cache.prompt_cache import CacheEntry, get_prompt_cache
 from app.engine.vllm_engine import GenerationRequest, get_engine
+from app.middleware.timeout import (
+    TimeoutError as GenerationTimeoutError,
+    get_generation_timeout,
+    with_timeout,
+)
 
 router = APIRouter(prefix="/v1", tags=["OpenAI Compatible API"])
 
@@ -106,6 +110,7 @@ def _map_finish_reason(reason: str | None) -> FinishReason | None:
     responses={
         400: {"model": ErrorResponse, "description": "Bad Request"},
         500: {"model": ErrorResponse, "description": "Internal Server Error"},
+        504: {"model": ErrorResponse, "description": "Gateway Timeout"},
     },
     summary="Create a completion",
     description="Creates a completion for the provided prompt and parameters.",
@@ -143,6 +148,63 @@ async def create_completion(
 
     request_id = f"cmpl-{uuid.uuid4().hex[:24]}"
 
+    # Streaming requests bypass cache
+    if request.stream:
+        gen_request = GenerationRequest(
+            request_id=request_id,
+            prompt=prompt,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop=request.stop,  # type: ignore
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            n=request.n,
+            logprobs=request.logprobs,
+            echo=request.echo,
+            best_of=request.best_of,
+        )
+        return EventSourceResponse(
+            _stream_completion(gen_request, engine.model_name, request_id),
+            media_type="text/event-stream",
+        )
+
+    # Check cache for deterministic requests
+    cache = get_prompt_cache()
+    stop_list = request.stop if isinstance(request.stop, list) else None
+
+    if cache.is_cacheable(request.temperature, request.n, request.stream):
+        cached = await cache.get(
+            model=engine.model_name,
+            prompt=prompt,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop=stop_list,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+        )
+
+        if cached is not None:
+            return CompletionResponse(
+                id=request_id,
+                created=int(time.time()),
+                model=engine.model_name,
+                choices=[
+                    CompletionChoice(
+                        text=cached.text,
+                        index=0,
+                        logprobs=None,
+                        finish_reason=_map_finish_reason(cached.finish_reason),
+                    )
+                ],
+                usage=UsageInfo(
+                    prompt_tokens=cached.prompt_tokens,
+                    completion_tokens=cached.completion_tokens,
+                    total_tokens=cached.prompt_tokens + cached.completion_tokens,
+                ),
+            )
+
     gen_request = GenerationRequest(
         request_id=request_id,
         prompt=prompt,
@@ -158,14 +220,34 @@ async def create_completion(
         best_of=request.best_of,
     )
 
-    if request.stream:
-        return EventSourceResponse(
-            _stream_completion(gen_request, engine.model_name, request_id),
-            media_type="text/event-stream",
+    try:
+        # Apply timeout to generation
+        timeout_seconds = get_generation_timeout()
+        output = await with_timeout(
+            engine.generate(gen_request),
+            timeout_seconds,
+            f"Generation timed out after {timeout_seconds} seconds",
         )
 
-    try:
-        output = await engine.generate(gen_request)
+        # Store in cache if cacheable
+        if cache.is_cacheable(request.temperature, request.n, request.stream):
+            await cache.set(
+                model=engine.model_name,
+                prompt=prompt,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=stop_list,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                entry=CacheEntry(
+                    text=output.text,
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    finish_reason=output.finish_reason,
+                    model=engine.model_name,
+                ),
+            )
 
         return CompletionResponse(
             id=request_id,
@@ -185,6 +267,15 @@ async def create_completion(
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
         )
+    except GenerationTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=ErrorDetail(
+                message=e.message,
+                type="timeout_error",
+                code="generation_timeout",
+            ).model_dump(),
+        ) from e
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -257,6 +348,7 @@ async def _stream_completion(
     responses={
         400: {"model": ErrorResponse, "description": "Bad Request"},
         500: {"model": ErrorResponse, "description": "Internal Server Error"},
+        504: {"model": ErrorResponse, "description": "Gateway Timeout"},
     },
     summary="Create a chat completion",
     description="Creates a completion for the provided chat conversation.",
@@ -293,6 +385,62 @@ async def create_chat_completion(
     prompt = _build_chat_prompt(request)
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
+    # Streaming requests bypass cache
+    if request.stream:
+        gen_request = GenerationRequest(
+            request_id=request_id,
+            prompt=prompt,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop=request.stop,  # type: ignore
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            n=request.n,
+        )
+        return EventSourceResponse(
+            _stream_chat_completion(gen_request, engine.model_name, request_id),
+            media_type="text/event-stream",
+        )
+
+    # Check cache for deterministic requests
+    cache = get_prompt_cache()
+    stop_list = request.stop if isinstance(request.stop, list) else None
+
+    if cache.is_cacheable(request.temperature, request.n, request.stream):
+        cached = await cache.get(
+            model=engine.model_name,
+            prompt=prompt,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop=stop_list,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+        )
+
+        if cached is not None:
+            return ChatCompletionResponse(
+                id=request_id,
+                created=int(time.time()),
+                model=engine.model_name,
+                choices=[
+                    ChatCompletionChoice(
+                        index=0,
+                        message=ChatCompletionMessage(
+                            role=ChatMessageRole.ASSISTANT,
+                            content=cached.text.strip(),
+                        ),
+                        finish_reason=_map_finish_reason(cached.finish_reason),
+                    )
+                ],
+                usage=UsageInfo(
+                    prompt_tokens=cached.prompt_tokens,
+                    completion_tokens=cached.completion_tokens,
+                    total_tokens=cached.prompt_tokens + cached.completion_tokens,
+                ),
+            )
+
     gen_request = GenerationRequest(
         request_id=request_id,
         prompt=prompt,
@@ -305,14 +453,34 @@ async def create_chat_completion(
         n=request.n,
     )
 
-    if request.stream:
-        return EventSourceResponse(
-            _stream_chat_completion(gen_request, engine.model_name, request_id),
-            media_type="text/event-stream",
+    try:
+        # Apply timeout to generation
+        timeout_seconds = get_generation_timeout()
+        output = await with_timeout(
+            engine.generate(gen_request),
+            timeout_seconds,
+            f"Generation timed out after {timeout_seconds} seconds",
         )
 
-    try:
-        output = await engine.generate(gen_request)
+        # Store in cache if cacheable
+        if cache.is_cacheable(request.temperature, request.n, request.stream):
+            await cache.set(
+                model=engine.model_name,
+                prompt=prompt,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=stop_list,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                entry=CacheEntry(
+                    text=output.text.strip(),
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    finish_reason=output.finish_reason,
+                    model=engine.model_name,
+                ),
+            )
 
         return ChatCompletionResponse(
             id=request_id,
@@ -334,6 +502,15 @@ async def create_chat_completion(
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
         )
+    except GenerationTimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=ErrorDetail(
+                message=e.message,
+                type="timeout_error",
+                code="generation_timeout",
+            ).model_dump(),
+        ) from e
     except Exception as e:
         raise HTTPException(
             status_code=500,
