@@ -42,6 +42,8 @@ from app.middleware.timeout import (
     get_generation_timeout,
     with_timeout,
 )
+from app.observability.logging import get_logger, log_generation
+from app.observability.metrics import get_metrics
 
 router = APIRouter(prefix="/v1", tags=["OpenAI Compatible API"])
 
@@ -173,6 +175,8 @@ async def create_completion(
     cache = get_prompt_cache()
     stop_list = request.stop if isinstance(request.stop, list) else None
 
+    metrics = get_metrics()
+
     if cache.is_cacheable(request.temperature, request.n, request.stream):
         cached = await cache.get(
             model=engine.model_name,
@@ -186,6 +190,16 @@ async def create_completion(
         )
 
         if cached is not None:
+            # Record cache hit
+            metrics.record_cache_hit()
+            log_generation(
+                model=engine.model_name,
+                prompt_tokens=cached.prompt_tokens,
+                completion_tokens=cached.completion_tokens,
+                duration_ms=0,
+                cached=True,
+            )
+
             return CompletionResponse(
                 id=request_id,
                 created=int(time.time()),
@@ -204,6 +218,8 @@ async def create_completion(
                     total_tokens=cached.prompt_tokens + cached.completion_tokens,
                 ),
             )
+        else:
+            metrics.record_cache_miss()
 
     gen_request = GenerationRequest(
         request_id=request_id,
@@ -223,10 +239,33 @@ async def create_completion(
     try:
         # Apply timeout to generation
         timeout_seconds = get_generation_timeout()
+        generation_start = time.perf_counter()
+
         output = await with_timeout(
             engine.generate(gen_request),
             timeout_seconds,
             f"Generation timed out after {timeout_seconds} seconds",
+        )
+
+        generation_duration = time.perf_counter() - generation_start
+
+        # Record metrics
+        metrics.record_generation(
+            model=engine.model_name,
+            endpoint="/v1/completions",
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            duration_seconds=generation_duration,
+            stream=False,
+        )
+
+        log_generation(
+            model=engine.model_name,
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            duration_ms=generation_duration * 1000,
+            stream=False,
+            cached=False,
         )
 
         # Store in cache if cacheable
@@ -248,6 +287,7 @@ async def create_completion(
                     model=engine.model_name,
                 ),
             )
+            metrics.record_cache_store()
 
         return CompletionResponse(
             id=request_id,
@@ -268,6 +308,7 @@ async def create_completion(
             ),
         )
     except GenerationTimeoutError as e:
+        metrics.record_timeout("/v1/completions")
         raise HTTPException(
             status_code=504,
             detail=ErrorDetail(
@@ -277,6 +318,7 @@ async def create_completion(
             ).model_dump(),
         ) from e
     except Exception as e:
+        metrics.record_error("/v1/completions", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail=ErrorDetail(
@@ -406,6 +448,7 @@ async def create_chat_completion(
     # Check cache for deterministic requests
     cache = get_prompt_cache()
     stop_list = request.stop if isinstance(request.stop, list) else None
+    metrics = get_metrics()
 
     if cache.is_cacheable(request.temperature, request.n, request.stream):
         cached = await cache.get(
@@ -420,6 +463,16 @@ async def create_chat_completion(
         )
 
         if cached is not None:
+            # Record cache hit
+            metrics.record_cache_hit()
+            log_generation(
+                model=engine.model_name,
+                prompt_tokens=cached.prompt_tokens,
+                completion_tokens=cached.completion_tokens,
+                duration_ms=0,
+                cached=True,
+            )
+
             return ChatCompletionResponse(
                 id=request_id,
                 created=int(time.time()),
@@ -440,6 +493,8 @@ async def create_chat_completion(
                     total_tokens=cached.prompt_tokens + cached.completion_tokens,
                 ),
             )
+        else:
+            metrics.record_cache_miss()
 
     gen_request = GenerationRequest(
         request_id=request_id,
@@ -456,10 +511,33 @@ async def create_chat_completion(
     try:
         # Apply timeout to generation
         timeout_seconds = get_generation_timeout()
+        generation_start = time.perf_counter()
+
         output = await with_timeout(
             engine.generate(gen_request),
             timeout_seconds,
             f"Generation timed out after {timeout_seconds} seconds",
+        )
+
+        generation_duration = time.perf_counter() - generation_start
+
+        # Record metrics
+        metrics.record_generation(
+            model=engine.model_name,
+            endpoint="/v1/chat/completions",
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            duration_seconds=generation_duration,
+            stream=False,
+        )
+
+        log_generation(
+            model=engine.model_name,
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            duration_ms=generation_duration * 1000,
+            stream=False,
+            cached=False,
         )
 
         # Store in cache if cacheable
@@ -481,6 +559,7 @@ async def create_chat_completion(
                     model=engine.model_name,
                 ),
             )
+            metrics.record_cache_store()
 
         return ChatCompletionResponse(
             id=request_id,
@@ -503,6 +582,7 @@ async def create_chat_completion(
             ),
         )
     except GenerationTimeoutError as e:
+        metrics.record_timeout("/v1/chat/completions")
         raise HTTPException(
             status_code=504,
             detail=ErrorDetail(
@@ -512,6 +592,7 @@ async def create_chat_completion(
             ).model_dump(),
         ) from e
     except Exception as e:
+        metrics.record_error("/v1/chat/completions", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail=ErrorDetail(

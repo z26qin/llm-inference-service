@@ -16,14 +16,17 @@ from typing import AsyncIterator
 import uvicorn
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from app.api.models import ErrorDetail, ErrorResponse
 from app.api.routes import router
 from app.cache.prompt_cache import get_prompt_cache
 from app.cache.redis_client import get_redis_client, initialize_redis, shutdown_redis
 from app.engine.vllm_engine import get_engine, initialize_engine, shutdown_engine
+from app.middleware.correlation import CorrelationIdMiddleware
 from app.middleware.rate_limiter import RateLimitMiddleware
+from app.observability.logging import configure_logging, get_logger
+from app.observability.metrics import get_metrics, setup_metrics
 
 
 # =============================================================================
@@ -66,7 +69,7 @@ settings = Settings()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan events.
 
-    Handles startup (model loading, Redis connection) and shutdown (graceful cleanup).
+    Handles startup (logging, metrics, Redis, model loading) and shutdown.
 
     Args:
         app: The FastAPI application instance.
@@ -74,34 +77,56 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Yields:
         Control to the application.
     """
-    # Startup
-    print(f"Starting {settings.app_name} v{settings.app_version}")
+    # Configure structured logging first
+    log_format = os.getenv("LOG_FORMAT", "json" if not settings.debug else "console")
+    log_level = os.getenv("LOG_LEVEL", "DEBUG" if settings.debug else "INFO")
+    configure_logging(level=log_level, json_format=(log_format == "json"))
+
+    logger = get_logger("startup")
+
+    # Initialize metrics
+    metrics = setup_metrics()
+
+    logger.info(
+        "Starting service",
+        app_name=settings.app_name,
+        version=settings.app_version,
+    )
 
     # Initialize Redis (optional, continues if unavailable)
     redis_client = await initialize_redis()
     if redis_client is not None:
-        print("Redis connected")
+        logger.info("Redis connected")
+        metrics.set_redis_connected(True)
     else:
-        print("Redis unavailable (caching and distributed rate limiting disabled)")
+        logger.warning("Redis unavailable, caching and distributed rate limiting disabled")
+        metrics.set_redis_connected(False)
 
-    print("Loading model... (this may take a while)")
+    logger.info("Loading model (this may take a while)")
 
     try:
         await initialize_engine()
         engine = await get_engine()
-        print(f"Model loaded: {engine.model_name}")
-        print(f"Server ready at http://{settings.host}:{settings.port}")
+        metrics.set_engine_ready(True)
+        metrics.set_model_info(engine.model_name)
+        logger.info(
+            "Model loaded",
+            model=engine.model_name,
+            server_url=f"http://{settings.host}:{settings.port}",
+        )
     except Exception as e:
-        print(f"Failed to initialize engine: {e}")
+        metrics.set_engine_ready(False)
+        logger.error("Failed to initialize engine", error=str(e))
         raise
 
     yield
 
     # Shutdown
-    print("Shutting down gracefully...")
+    logger.info("Shutting down gracefully")
+    metrics.set_engine_ready(False)
     await shutdown_engine()
     await shutdown_redis()
-    print("Shutdown complete")
+    logger.info("Shutdown complete")
 
 
 # =============================================================================
@@ -136,7 +161,8 @@ OpenAI-compatible API powered by vLLM with:
 - `GET /v1/models` - List available models
 - `GET /health` - Health check
 - `GET /ready` - Readiness probe
-- `GET /metrics` - Cache and rate limit metrics
+- `GET /metrics` - Prometheus metrics
+- `GET /metrics/json` - JSON metrics for debugging
         """,
         docs_url="/docs",
         redoc_url="/redoc",
@@ -152,6 +178,9 @@ OpenAI-compatible API powered by vLLM with:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Correlation ID middleware (request tracing)
+    app.add_middleware(CorrelationIdMiddleware)
 
     # Rate limiting middleware (lazy initialization after Redis connects)
     app.add_middleware(RateLimitMiddleware)
@@ -251,13 +280,31 @@ def _register_health_endpoints(app: FastAPI) -> None:
     @app.get(
         "/metrics",
         tags=["Health"],
-        summary="Service metrics",
-        description="Cache statistics and rate limiter configuration.",
+        summary="Prometheus metrics",
+        description="Prometheus-formatted metrics for scraping.",
+        response_class=Response,
     )
-    async def metrics() -> dict:
-        """Metrics endpoint for monitoring.
+    async def prometheus_metrics() -> Response:
+        """Prometheus metrics endpoint.
 
-        Returns cache statistics and rate limiter configuration.
+        Returns metrics in Prometheus text format for scraping.
+        """
+        metrics = get_metrics()
+        return Response(
+            content=metrics.generate_metrics(),
+            media_type=metrics.get_content_type(),
+        )
+
+    @app.get(
+        "/metrics/json",
+        tags=["Health"],
+        summary="JSON metrics",
+        description="JSON-formatted metrics for debugging.",
+    )
+    async def json_metrics() -> dict:
+        """JSON metrics endpoint for debugging.
+
+        Returns cache statistics and rate limiter configuration in JSON.
         """
         # Cache stats
         cache = get_prompt_cache()
@@ -267,7 +314,20 @@ def _register_health_endpoints(app: FastAPI) -> None:
         redis_client = await get_redis_client()
         redis_connected = redis_client is not None and redis_client.is_connected()
 
+        # Engine status
+        try:
+            engine = await get_engine()
+            engine_ready = engine.is_ready()
+            model_name = engine.model_name
+        except Exception:
+            engine_ready = False
+            model_name = None
+
         return {
+            "engine": {
+                "ready": engine_ready,
+                "model": model_name,
+            },
             "cache": {
                 "enabled": cache.config.enabled,
                 "connected": redis_connected,
@@ -296,6 +356,7 @@ def _register_health_endpoints(app: FastAPI) -> None:
             "health": "/health",
             "ready": "/ready",
             "metrics": "/metrics",
+            "metrics_json": "/metrics/json",
         }
 
 
@@ -311,6 +372,19 @@ def _register_exception_handlers(app: FastAPI) -> None:
         request: Request, exc: Exception
     ) -> JSONResponse:
         """Handle uncaught exceptions with OpenAI-compatible error format."""
+        logger = get_logger("error")
+        logger.error(
+            "Unhandled exception",
+            path=request.url.path,
+            method=request.method,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+
+        # Record error in metrics
+        metrics = get_metrics()
+        metrics.record_error(request.url.path, type(exc).__name__)
+
         error_response = ErrorResponse(
             error=ErrorDetail(
                 message=str(exc) if settings.debug else "Internal server error",
