@@ -4,6 +4,8 @@ vLLM Engine Wrapper.
 Provides an async interface to vLLM's inference engine with support for
 streaming and non-streaming completions, automatic batching, and
 generation parameter management.
+
+Falls back to mock engine when vLLM is not available (e.g., on macOS without CUDA).
 """
 
 from __future__ import annotations
@@ -13,8 +15,16 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, AsyncIterator
 
-from vllm import AsyncLLMEngine, SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
+# Try to import vLLM, fall back to mock if unavailable
+try:
+    from vllm import AsyncLLMEngine, SamplingParams
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+    AsyncLLMEngine = None  # type: ignore
+    SamplingParams = None  # type: ignore
+    AsyncEngineArgs = None  # type: ignore
 
 if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
@@ -315,13 +325,27 @@ class VLLMEngine:
 _engine_instance: VLLMEngine | None = None
 _engine_lock = asyncio.Lock()
 
+# Import mock engine for fallback
+if not VLLM_AVAILABLE:
+    from app.engine.mock_engine import (
+        MockVLLMEngine,
+        get_engine as mock_get_engine,
+        initialize_engine as mock_initialize_engine,
+        shutdown_engine as mock_shutdown_engine,
+        GenerationRequest as MockGenerationRequest,
+        GenerationOutput as MockGenerationOutput,
+    )
+
 
 async def get_engine() -> VLLMEngine:
     """Get or create the global engine instance.
 
     Returns:
-        The singleton VLLMEngine instance.
+        The singleton VLLMEngine instance (or MockVLLMEngine if vLLM unavailable).
     """
+    if not VLLM_AVAILABLE:
+        return await mock_get_engine()  # type: ignore
+
     global _engine_instance
 
     async with _engine_lock:
@@ -336,8 +360,12 @@ async def initialize_engine() -> VLLMEngine:
     Should be called during application startup.
 
     Returns:
-        The initialized and started VLLMEngine.
+        The initialized and started VLLMEngine (or MockVLLMEngine if vLLM unavailable).
     """
+    if not VLLM_AVAILABLE:
+        print("WARNING: vLLM not available, using mock engine for development")
+        return await mock_initialize_engine()  # type: ignore
+
     engine = await get_engine()
     await engine.start()
     return engine
@@ -348,6 +376,10 @@ async def shutdown_engine() -> None:
 
     Should be called during application shutdown.
     """
+    if not VLLM_AVAILABLE:
+        await mock_shutdown_engine()
+        return
+
     global _engine_instance
 
     async with _engine_lock:
