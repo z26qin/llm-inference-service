@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-inference-config
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: llm-inference
+    app.kubernetes.io/component: config
+data:
+  # Model Settings
+  MODEL_NAME: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  TENSOR_PARALLEL_SIZE: "1"
+  GPU_MEMORY_UTILIZATION: "0.90"
+  MAX_NUM_SEQS: "256"
+  DTYPE: "auto"
+  ENFORCE_EAGER: "false"
+  TRUST_REMOTE_CODE: "true"
+
+  # Server Settings
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  WORKERS: "1"
+  DEBUG: "false"
+  SHUTDOWN_TIMEOUT: "30"
+
+  # CORS Settings
+  CORS_ORIGINS: "*"
+  CORS_ALLOW_CREDENTIALS: "true"
+
+  # Batching Settings
+  MAX_BATCH_SIZE: "32"
+  MAX_WAIT_TIME_MS: "100"
+  REQUEST_TIMEOUT_MS: "30000"
+  MAX_QUEUE_SIZE: "1000"
+
+  # Redis Settings (use service DNS)
+  REDIS_URL: "redis://redis-service.llm-inference.svc.cluster.local:6379/0"
+  REDIS_POOL_SIZE: "10"
+  CACHE_ENABLED: "true"
+  CACHE_TTL_SECONDS: "3600"
+  CACHE_TEMPERATURE_THRESHOLD: "0.01"
+
+  # Rate Limiting Settings
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_REQUESTS_PER_MINUTE: "60"
+  RATE_LIMIT_WINDOW_SECONDS: "60"
+  RATE_LIMIT_USE_REDIS: "true"
+
+  # Timeout Settings
+  GENERATION_TIMEOUT_SECONDS: "120"
+  STREAMING_CHUNK_TIMEOUT_SECONDS: "30"
+
+  # Logging Settings
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "INFO"

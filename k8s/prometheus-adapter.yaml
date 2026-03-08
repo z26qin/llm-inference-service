@@ -1,0 +1,110 @@
+# Prometheus Adapter Configuration for Custom Metrics
+# This configures the prometheus-adapter to expose LLM metrics to the HPA
+#
+# Install prometheus-adapter:
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring \
+#     -f k8s/prometheus-adapter.yaml
+
+# Prometheus Adapter Helm Values
+prometheus:
+  url: http://prometheus-server.monitoring.svc.cluster.local
+  port: 80
+
+rules:
+  # Rule for in-flight requests gauge
+  custom:
+    - seriesQuery: 'llm_requests_in_progress{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^(.*)$"
+        as: "llm_requests_in_progress"
+      metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+
+    # Rule for request rate (requests per second)
+    - seriesQuery: 'llm_requests_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^(.*)_total$"
+        as: "llm_requests_per_second"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+
+    # Rule for p95 latency
+    - seriesQuery: 'llm_request_latency_seconds_bucket{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^(.*)_bucket$"
+        as: "llm_request_latency_p95"
+      metricsQuery: 'histogram_quantile(0.95, sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (le, <<.GroupBy>>))'
+
+    # Rule for tokens per second throughput
+    - seriesQuery: 'llm_tokens_generated_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^(.*)_total$"
+        as: "llm_tokens_per_second"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+
+    # Rule for cache hit ratio
+    - seriesQuery: 'llm_cache_hits_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: ".*"
+        as: "llm_cache_hit_ratio"
+      metricsQuery: |
+        sum(rate(llm_cache_hits_total{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>) /
+        (sum(rate(llm_cache_hits_total{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>) +
+         sum(rate(llm_cache_misses_total{<<.LabelMatchers>>}[5m])) by (<<.GroupBy>>))
+
+    # Rule for error rate
+    - seriesQuery: 'llm_errors_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^(.*)_total$"
+        as: "llm_error_rate"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+
+  # Default rules for resource metrics
+  default: true
+
+  # External metrics (optional, for KEDA integration)
+  external: []
+
+# Resource configuration
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi

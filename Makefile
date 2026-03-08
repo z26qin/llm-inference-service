@@ -3,7 +3,8 @@
 # =============================================================================
 # Common development and deployment commands
 
-.PHONY: help install install-dev run run-dev build up down logs test lint format clean
+.PHONY: help install install-dev run run-dev build up up-build down logs logs-llm test lint format clean \
+        up-monitoring up-full docker-status docker-shell redis-cli load-test load-test-headless
 
 # Default target
 .DEFAULT_GOAL := help
@@ -58,14 +59,15 @@ build: ## Build Docker image
 build-dev: ## Build development Docker image
 	$(DOCKER) build -t $(IMAGE_NAME):dev --target development .
 
-up: ## Start services with Docker Compose (GPU)
+up: ## Start LLM service + Redis
 	$(DOCKER_COMPOSE) up -d
+	@echo ""
+	@echo "Services started:"
+	@echo "  - LLM Service: http://localhost:8000"
+	@echo "  - Redis:       localhost:6379"
 
-up-cpu: ## Start services without GPU
-	$(DOCKER_COMPOSE) --profile cpu up -d
-
-up-dev: ## Start development services
-	$(DOCKER_COMPOSE) --profile dev up -d
+up-build: ## Build and start services
+	$(DOCKER_COMPOSE) up -d --build
 
 down: ## Stop all services
 	$(DOCKER_COMPOSE) down
@@ -73,8 +75,8 @@ down: ## Stop all services
 logs: ## Follow service logs
 	$(DOCKER_COMPOSE) logs -f
 
-logs-service: ## Follow main service logs only
-	$(DOCKER_COMPOSE) logs -f llm-service
+logs-llm: ## Follow LLM service logs only
+	$(DOCKER_COMPOSE) logs -f llm
 
 restart: ## Restart services
 	$(DOCKER_COMPOSE) restart
@@ -196,3 +198,47 @@ env-template: ## Generate .env template
 
 version: ## Show version
 	@$(PYTHON) -c "from app import __version__; print(__version__)"
+
+# =============================================================================
+# Docker Compose - Full Stack
+# =============================================================================
+
+up-monitoring: ## Start with Prometheus + Grafana monitoring
+	$(DOCKER_COMPOSE) --profile monitoring up -d
+	@echo ""
+	@echo "Services started:"
+	@echo "  - LLM Service: http://localhost:8000"
+	@echo "  - Prometheus:  http://localhost:9090"
+	@echo "  - Grafana:     http://localhost:3000 (admin/admin)"
+
+up-full: ## Start all services (LLM + Redis + Prometheus + Grafana)
+	$(DOCKER_COMPOSE) --profile full up -d
+	@echo ""
+	@echo "All services started:"
+	@echo "  - LLM Service: http://localhost:8000"
+	@echo "  - Redis:       localhost:6379"
+	@echo "  - Prometheus:  http://localhost:9090"
+	@echo "  - Grafana:     http://localhost:3000 (admin/admin)"
+
+docker-status: ## Show Docker container status
+	@echo "=== Containers ==="
+	$(DOCKER_COMPOSE) ps
+	@echo ""
+	@echo "=== Resource Usage ==="
+	$(DOCKER) stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+docker-shell: ## Open shell in LLM container
+	$(DOCKER_COMPOSE) exec llm /bin/sh
+
+redis-cli: ## Open Redis CLI
+	$(DOCKER_COMPOSE) exec redis redis-cli
+
+# =============================================================================
+# Load Testing
+# =============================================================================
+
+load-test: ## Run Locust load test (requires: pip install locust)
+	locust -f tests/load/locustfile.py --host http://localhost:8000
+
+load-test-headless: ## Run headless load test (10 users, 60 seconds)
+	locust -f tests/load/locustfile.py --host http://localhost:8000 --headless -u 10 -r 2 --run-time 60s

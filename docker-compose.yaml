@@ -1,0 +1,173 @@
+# =============================================================================
+# LLM Inference Service - Docker Compose
+# =============================================================================
+# Local development and testing stack
+#
+# Usage:
+#   docker compose up -d          # Start all services
+#   docker compose up -d llm      # Start LLM service only
+#   docker compose logs -f        # View logs
+#   docker compose down           # Stop all services
+#
+# Profiles:
+#   default    - LLM service + Redis
+#   monitoring - Add Prometheus + Grafana
+#   full       - Everything
+
+services:
+  # ===========================================================================
+  # LLM Inference Service
+  # ===========================================================================
+  llm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: llm-inference-service:latest
+    container_name: llm-inference
+    ports:
+      - "8000:8000"
+    environment:
+      # Model Settings
+      MODEL_NAME: ${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+      TENSOR_PARALLEL_SIZE: ${TENSOR_PARALLEL_SIZE:-1}
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.90}
+      MAX_NUM_SEQS: ${MAX_NUM_SEQS:-256}
+      DTYPE: ${DTYPE:-auto}
+      ENFORCE_EAGER: ${ENFORCE_EAGER:-false}
+      TRUST_REMOTE_CODE: ${TRUST_REMOTE_CODE:-true}
+
+      # Server Settings
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      DEBUG: ${DEBUG:-false}
+
+      # Redis Settings
+      REDIS_URL: redis://redis:6379/0
+      REDIS_POOL_SIZE: "10"
+      CACHE_ENABLED: "true"
+      CACHE_TTL_SECONDS: "3600"
+
+      # Rate Limiting
+      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_REQUESTS_PER_MINUTE: "60"
+      RATE_LIMIT_USE_REDIS: "true"
+
+      # Timeouts
+      GENERATION_TIMEOUT_SECONDS: "120"
+
+      # Logging
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # HuggingFace
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      - llm-network
+
+  # ===========================================================================
+  # Redis - Caching & Rate Limiting
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: llm-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --save ""
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - llm-network
+
+  # ===========================================================================
+  # Prometheus - Metrics Collection (monitoring profile)
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: llm-prometheus
+    profiles:
+      - monitoring
+      - full
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=7d'
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - llm
+    restart: unless-stopped
+    networks:
+      - llm-network
+
+  # ===========================================================================
+  # Grafana - Dashboards (monitoring profile)
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: llm-grafana
+    profiles:
+      - monitoring
+      - full
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboard.json:/var/lib/grafana/dashboards/llm-inference.json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - llm-network
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  llm-network:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  model-cache:
+    driver: local
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local

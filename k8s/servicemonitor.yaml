@@ -1,0 +1,119 @@
+# ServiceMonitor for Prometheus Operator
+# This tells Prometheus to scrape metrics from the LLM inference service
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: llm-inference-monitor
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: llm-inference
+    app.kubernetes.io/component: monitoring
+    # This label must match Prometheus operator's serviceMonitorSelector
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llm-inference
+      app.kubernetes.io/component: server
+  namespaceSelector:
+    matchNames:
+      - llm-inference
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true
+---
+# PodMonitor (alternative if ServiceMonitor doesn't work)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: llm-inference-pod-monitor
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: llm-inference
+    app.kubernetes.io/component: monitoring
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llm-inference
+      app.kubernetes.io/component: server
+  namespaceSelector:
+    matchNames:
+      - llm-inference
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+---
+# PrometheusRule for alerting
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: llm-inference-alerts
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: llm-inference
+    app.kubernetes.io/component: alerting
+    release: prometheus
+spec:
+  groups:
+    - name: llm-inference.rules
+      rules:
+        # High error rate alert
+        - alert: LLMHighErrorRate
+          expr: |
+            sum(rate(llm_errors_total[5m])) /
+            sum(rate(llm_requests_total[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High error rate in LLM inference service"
+            description: "Error rate is above 5% for the last 5 minutes"
+
+        # High latency alert
+        - alert: LLMHighLatency
+          expr: |
+            histogram_quantile(0.95, sum(rate(llm_request_latency_seconds_bucket[5m])) by (le)) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High latency in LLM inference service"
+            description: "P95 latency is above 5 seconds for the last 5 minutes"
+
+        # Service down alert
+        - alert: LLMServiceDown
+          expr: up{job="llm-inference"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "LLM inference service is down"
+            description: "LLM inference service has been down for more than 1 minute"
+
+        # Cache hit rate low
+        - alert: LLMCacheHitRateLow
+          expr: |
+            sum(rate(llm_cache_hits_total[5m])) /
+            (sum(rate(llm_cache_hits_total[5m])) + sum(rate(llm_cache_misses_total[5m]))) < 0.3
+          for: 15m
+          labels:
+            severity: info
+          annotations:
+            summary: "Low cache hit rate"
+            description: "Cache hit rate is below 30% for the last 15 minutes"
+
+        # Rate limiting active
+        - alert: LLMRateLimitingActive
+          expr: sum(rate(llm_rate_limit_hits_total[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Rate limiting is actively blocking requests"
+            description: "More than 1 request/second is being rate limited"

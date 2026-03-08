@@ -1,0 +1,126 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llm-inference-hpa
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: llm-inference
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llm-inference
+
+  # Replica bounds
+  minReplicas: 1
+  maxReplicas: 10
+
+  # Scaling behavior
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+      selectPolicy: Min
+
+  metrics:
+    # CPU utilization - baseline scaling metric
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # Memory utilization - prevent OOM
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+    # Custom metric: In-flight requests per pod
+    # Scale up when average requests per pod > 10
+    - type: Pods
+      pods:
+        metric:
+          name: llm_requests_in_progress
+        target:
+          type: AverageValue
+          averageValue: "10"
+
+    # Custom metric: Request rate (requests per second)
+    # Scale up when rate exceeds 5 req/s per pod
+    - type: Pods
+      pods:
+        metric:
+          name: llm_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "5"
+
+    # Custom metric: Request latency p95
+    # Scale up when p95 latency > 2 seconds
+    - type: Pods
+      pods:
+        metric:
+          name: llm_request_latency_p95
+        target:
+          type: AverageValue
+          averageValue: "2000m"  # 2 seconds in millicores format
+
+---
+# Alternative HPA using only standard CPU/Memory (no Prometheus adapter needed)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llm-inference-hpa-simple
+  namespace: llm-inference
+  labels:
+    app.kubernetes.io/name: llm-inference
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/variant: simple
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llm-inference
+
+  minReplicas: 1
+  maxReplicas: 5
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

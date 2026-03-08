@@ -1,0 +1,34 @@
+# Kustomize configuration for LLM Inference Service
+# Usage: kubectl apply -k k8s/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: llm-inference
+
+# Resources to deploy
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - redis.yaml
+  - deployment.yaml
+  - service.yaml
+  # Choose one HPA:
+  - hpa.yaml  # Full HPA with custom metrics (requires prometheus-adapter)
+  # - hpa-simple.yaml  # Simple HPA with CPU/Memory only
+
+# Common labels
+commonLabels:
+  app.kubernetes.io/part-of: llm-inference-service
+  app.kubernetes.io/managed-by: kustomize
+
+# Image configuration (override in overlays)
+images:
+  - name: llm-inference-service
+    newTag: latest
+
+# ConfigMap generator (alternative to static configmap.yaml)
+# configMapGenerator:
+#   - name: llm-inference-config
+#     envs:
+#       - .env
